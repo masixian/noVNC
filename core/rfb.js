@@ -1,17 +1,20 @@
 /*
  * noVNC: HTML5 VNC client
- * Copyright (C) 2018 The noVNC Authors
+ * Copyright (C) 2020 The noVNC Authors
  * Licensed under MPL 2.0 (see LICENSE.txt)
  *
  * See README.md for usage and integration instructions.
  *
  */
 
+import { toUnsigned32bit, toSigned32bit } from './util/int.js';
 import * as Log from './util/logging.js';
-import { decodeUTF8 } from './util/strings.js';
+import { encodeUTF8, decodeUTF8 } from './util/strings.js';
 import { dragThreshold } from './util/browser.js';
 import EventTargetMixin from './util/eventtarget.js';
 import Display from "./display.js";
+import Inflator from "./inflator.js";
+import Deflator from "./deflator.js";
 import Keyboard from "./input/keyboard.js";
 import Mouse from "./input/mouse.js";
 import Cursor from "./util/cursor.js";
@@ -33,6 +36,23 @@ import TightPNGDecoder from "./decoders/tightpng.js";
 const DISCONNECT_TIMEOUT = 3;
 const DEFAULT_BACKGROUND = 'rgb(40, 40, 40)';
 
+// Extended clipboard pseudo-encoding formats
+const extendedClipboardFormatText   = 1;
+/*eslint-disable no-unused-vars */
+const extendedClipboardFormatRtf    = 1 << 1;
+const extendedClipboardFormatHtml   = 1 << 2;
+const extendedClipboardFormatDib    = 1 << 3;
+const extendedClipboardFormatFiles  = 1 << 4;
+/*eslint-enable */
+
+// Extended clipboard pseudo-encoding actions
+const extendedClipboardActionCaps    = 1 << 24;
+const extendedClipboardActionRequest = 1 << 25;
+const extendedClipboardActionPeek    = 1 << 26;
+const extendedClipboardActionNotify  = 1 << 27;
+const extendedClipboardActionProvide = 1 << 28;
+
+
 export default class RFB extends EventTargetMixin {
     constructor(target, url, options) {
         if (!target) {
@@ -52,7 +72,7 @@ export default class RFB extends EventTargetMixin {
         this._rfb_credentials = options.credentials || {};
         this._shared = 'shared' in options ? !!options.shared : true;
         this._repeaterID = options.repeaterID || '';
-        this._showDotCursor = options.showDotCursor || false;
+        this._wsProtocols = options.wsProtocols || [];
 
         // Internal state
         this._rfb_connection_state = '';
@@ -64,6 +84,7 @@ export default class RFB extends EventTargetMixin {
         this._rfb_version = 0;
         this._rfb_max_version = 3.8;
         this._rfb_tightvnc = false;
+        this._rfb_vencrypt_state = 0;
         this._rfb_xvp_ver = 0;
 
         this._fb_width = 0;
@@ -83,6 +104,10 @@ export default class RFB extends EventTargetMixin {
         this._screen_flags = 0;
 
         this._qemuExtKeyEventSupported = false;
+
+        this._clipboardText = null;
+        this._clipboardServerCapabilitiesActions = {};
+        this._clipboardServerCapabilitiesFormats = {};
 
         // Internal objects
         this._sock = null;              // Websock object
@@ -172,7 +197,6 @@ export default class RFB extends EventTargetMixin {
             throw exc;
         }
         this._display.onflush = this._onFlush.bind(this);
-        this._display.clear();
 
         this._keyboard = new Keyboard(this._canvas);
         this._keyboard.onkeyevent = this._handleKeyEvent.bind(this);
@@ -246,6 +270,15 @@ export default class RFB extends EventTargetMixin {
         this._clipViewport = false;
         this._scaleViewport = false;
         this._resizeSession = false;
+
+        this._showDotCursor = false;
+        if (options.showDotCursor !== undefined) {
+            Log.Warn("Specifying showDotCursor as a RFB constructor argument is deprecated");
+            this._showDotCursor = options.showDotCursor;
+        }
+
+        this._qualityLevel = 6;
+        this._compressionLevel = 2;
     }
 
     // ===== PROPERTIES =====
@@ -307,6 +340,46 @@ export default class RFB extends EventTargetMixin {
 
     get background() { return this._screen.style.background; }
     set background(cssValue) { this._screen.style.background = cssValue; }
+
+    get qualityLevel() {
+        return this._qualityLevel;
+    }
+    set qualityLevel(qualityLevel) {
+        if (!Number.isInteger(qualityLevel) || qualityLevel < 0 || qualityLevel > 9) {
+            Log.Error("qualityLevel must be an integer between 0 and 9");
+            return;
+        }
+
+        if (this._qualityLevel === qualityLevel) {
+            return;
+        }
+
+        this._qualityLevel = qualityLevel;
+
+        if (this._rfb_connection_state === 'connected') {
+            this._sendEncodings();
+        }
+    }
+
+    get compressionLevel() {
+        return this._compressionLevel;
+    }
+    set compressionLevel(compressionLevel) {
+        if (!Number.isInteger(compressionLevel) || compressionLevel < 0 || compressionLevel > 9) {
+            Log.Error("compressionLevel must be an integer between 0 and 9");
+            return;
+        }
+
+        if (this._compressionLevel === compressionLevel) {
+            return;
+        }
+
+        this._compressionLevel = compressionLevel;
+
+        if (this._rfb_connection_state === 'connected') {
+            this._sendEncodings();
+        }
+    }
 
     // ===== PUBLIC METHODS =====
 
@@ -385,7 +458,21 @@ export default class RFB extends EventTargetMixin {
 
     clipboardPasteFrom(text) {
         if (this._rfb_connection_state !== 'connected' || this._viewOnly) { return; }
-        RFB.messages.clientCutText(this._sock, text);
+
+        if (this._clipboardServerCapabilitiesFormats[extendedClipboardFormatText] &&
+            this._clipboardServerCapabilitiesActions[extendedClipboardActionNotify]) {
+
+            this._clipboardText = text;
+            RFB.messages.extendedClipboardNotify(this._sock, [extendedClipboardFormatText]);
+        } else {
+            let data = new Uint8Array(text.length);
+            for (let i = 0; i < text.length; i++) {
+                // FIXME: text can have values outside of Latin1/Uint8
+                data[i] = text.charCodeAt(i);
+            }
+
+            RFB.messages.clientCutText(this._sock, data);
+        }
     }
 
     // ===== PRIVATE METHODS =====
@@ -397,7 +484,7 @@ export default class RFB extends EventTargetMixin {
 
         try {
             // WebSocket.onopen transitions to the RFB init states
-            this._sock.open(this._url, ['binary']);
+            this._sock.open(this._url, this._wsProtocols);
         } catch (e) {
             if (e.name === 'SyntaxError') {
                 this._fail("Invalid host or port (" + e + ")");
@@ -457,6 +544,13 @@ export default class RFB extends EventTargetMixin {
         }
 
         this.focus();
+    }
+
+    _setDesktopName(name) {
+        this._fb_name = name;
+        this.dispatchEvent(new CustomEvent(
+            "desktopname",
+            { detail: { name: this._fb_name } }));
     }
 
     _windowResize(event) {
@@ -871,6 +965,8 @@ export default class RFB extends EventTargetMixin {
                 this._rfb_auth_scheme = 16; // Tight
             } else if (includes(2, types)) {
                 this._rfb_auth_scheme = 2; // VNC Auth
+            } else if (includes(19, types)) {
+                this._rfb_auth_scheme = 19; // VeNCrypt Auth
             } else {
                 return this._fail("Unsupported security types (types: " + types + ")");
             }
@@ -928,9 +1024,9 @@ export default class RFB extends EventTargetMixin {
 
     // authentication
     _negotiate_xvp_auth() {
-        if (!this._rfb_credentials.username ||
-            !this._rfb_credentials.password ||
-            !this._rfb_credentials.target) {
+        if (this._rfb_credentials.username === undefined ||
+            this._rfb_credentials.password === undefined ||
+            this._rfb_credentials.target === undefined) {
             this.dispatchEvent(new CustomEvent(
                 "credentialsrequired",
                 { detail: { types: ["username", "password", "target"] } }));
@@ -946,10 +1042,98 @@ export default class RFB extends EventTargetMixin {
         return this._negotiate_authentication();
     }
 
+    // VeNCrypt authentication, currently only supports version 0.2 and only Plain subtype
+    _negotiate_vencrypt_auth() {
+
+        // waiting for VeNCrypt version
+        if (this._rfb_vencrypt_state == 0) {
+            if (this._sock.rQwait("vencrypt version", 2)) { return false; }
+
+            const major = this._sock.rQshift8();
+            const minor = this._sock.rQshift8();
+
+            if (!(major == 0 && minor == 2)) {
+                return this._fail("Unsupported VeNCrypt version " + major + "." + minor);
+            }
+
+            this._sock.send([0, 2]);
+            this._rfb_vencrypt_state = 1;
+        }
+
+        // waiting for ACK
+        if (this._rfb_vencrypt_state == 1) {
+            if (this._sock.rQwait("vencrypt ack", 1)) { return false; }
+
+            const res = this._sock.rQshift8();
+
+            if (res != 0) {
+                return this._fail("VeNCrypt failure " + res);
+            }
+
+            this._rfb_vencrypt_state = 2;
+        }
+        // must fall through here (i.e. no "else if"), beacause we may have already received
+        // the subtypes length and won't be called again
+
+        if (this._rfb_vencrypt_state == 2) { // waiting for subtypes length
+            if (this._sock.rQwait("vencrypt subtypes length", 1)) { return false; }
+
+            const subtypes_length = this._sock.rQshift8();
+            if (subtypes_length < 1) {
+                return this._fail("VeNCrypt subtypes empty");
+            }
+
+            this._rfb_vencrypt_subtypes_length = subtypes_length;
+            this._rfb_vencrypt_state = 3;
+        }
+
+        // waiting for subtypes list
+        if (this._rfb_vencrypt_state == 3) {
+            if (this._sock.rQwait("vencrypt subtypes", 4 * this._rfb_vencrypt_subtypes_length)) { return false; }
+
+            const subtypes = [];
+            for (let i = 0; i < this._rfb_vencrypt_subtypes_length; i++) {
+                subtypes.push(this._sock.rQshift32());
+            }
+
+            // 256 = Plain subtype
+            if (subtypes.indexOf(256) != -1) {
+                // 0x100 = 256
+                this._sock.send([0, 0, 1, 0]);
+                this._rfb_vencrypt_state = 4;
+            } else {
+                return this._fail("VeNCrypt Plain subtype not offered by server");
+            }
+        }
+
+        // negotiated Plain subtype, server waits for password
+        if (this._rfb_vencrypt_state == 4) {
+            if (!this._rfb_credentials.username ||
+                !this._rfb_credentials.password) {
+                this.dispatchEvent(new CustomEvent(
+                    "credentialsrequired",
+                    { detail: { types: ["username", "password"] } }));
+                return false;
+            }
+
+            const user = encodeUTF8(this._rfb_credentials.username);
+            const pass = encodeUTF8(this._rfb_credentials.password);
+
+            // XXX we assume lengths are <= 255 (should not be an issue in the real world)
+            this._sock.send([0, 0, 0, user.length]);
+            this._sock.send([0, 0, 0, pass.length]);
+            this._sock.send_string(user);
+            this._sock.send_string(pass);
+
+            this._rfb_init_state = "SecurityResult";
+            return true;
+        }
+    }
+
     _negotiate_std_vnc_auth() {
         if (this._sock.rQwait("auth challenge", 16)) { return false; }
 
-        if (!this._rfb_credentials.password) {
+        if (this._rfb_credentials.password === undefined) {
             this.dispatchEvent(new CustomEvent(
                 "credentialsrequired",
                 { detail: { types: ["password"] } }));
@@ -960,6 +1144,23 @@ export default class RFB extends EventTargetMixin {
         const challenge = Array.prototype.slice.call(this._sock.rQshiftBytes(16));
         const response = RFB.genDES(this._rfb_credentials.password, challenge);
         this._sock.send(response);
+        this._rfb_init_state = "SecurityResult";
+        return true;
+    }
+
+    _negotiate_tight_unix_auth() {
+        if (this._rfb_credentials.username === undefined ||
+            this._rfb_credentials.password === undefined) {
+            this.dispatchEvent(new CustomEvent(
+                "credentialsrequired",
+                { detail: { types: ["username", "password"] } }));
+            return false;
+        }
+
+        this._sock.send([0, 0, 0, this._rfb_credentials.username.length]);
+        this._sock.send([0, 0, 0, this._rfb_credentials.password.length]);
+        this._sock.send_string(this._rfb_credentials.username);
+        this._sock.send_string(this._rfb_credentials.password);
         this._rfb_init_state = "SecurityResult";
         return true;
     }
@@ -1031,7 +1232,8 @@ export default class RFB extends EventTargetMixin {
 
         const clientSupportedTypes = {
             'STDVNOAUTH__': 1,
-            'STDVVNCAUTH_': 2
+            'STDVVNCAUTH_': 2,
+            'TGHTULGNAUTH': 129
         };
 
         const serverSupportedTypes = [];
@@ -1055,6 +1257,9 @@ export default class RFB extends EventTargetMixin {
                         return true;
                     case 'STDVVNCAUTH_': // VNC auth
                         this._rfb_auth_scheme = 2;
+                        return this._init_msg();
+                    case 'TGHTULGNAUTH': // UNIX auth
+                        this._rfb_auth_scheme = 129;
                         return this._init_msg();
                     default:
                         return this._fail("Unsupported tiny auth scheme " +
@@ -1084,6 +1289,12 @@ export default class RFB extends EventTargetMixin {
 
             case 16:  // TightVNC Security Type
                 return this._negotiate_tight_auth();
+
+            case 19:  // VeNCrypt Security Type
+                return this._negotiate_vencrypt_auth();
+
+            case 129:  // TightVNC UNIX Security Type
+                return this._negotiate_tight_unix_auth();
 
             default:
                 return this._fail("Unsupported auth scheme (scheme: " +
@@ -1143,7 +1354,8 @@ export default class RFB extends EventTargetMixin {
         /* Connection name/title */
         const name_length = this._sock.rQshift32();
         if (this._sock.rQwait('server init name', name_length, 24)) { return false; }
-        this._fb_name = decodeUTF8(this._sock.rQshiftStr(name_length));
+        let name = this._sock.rQshiftStr(name_length);
+        name = decodeUTF8(name, true);
 
         if (this._rfb_tightvnc) {
             if (this._sock.rQwait('TightVNC extended server init header', 8, 24 + name_length)) { return false; }
@@ -1182,23 +1394,8 @@ export default class RFB extends EventTargetMixin {
                   ", green_shift: " + green_shift +
                   ", blue_shift: " + blue_shift);
 
-        if (big_endian !== 0) {
-            Log.Warn("Server native endian is not little endian");
-        }
-
-        if (red_shift !== 16) {
-            Log.Warn("Server native red-shift is not 16");
-        }
-
-        if (blue_shift !== 0) {
-            Log.Warn("Server native blue-shift is not 0");
-        }
-
         // we're past the point where we could backtrack, so it's safe to call this
-        this.dispatchEvent(new CustomEvent(
-            "desktopname",
-            { detail: { name: this._fb_name } }));
-
+        this._setDesktopName(name);
         this._resize(width, height);
 
         if (!this._viewOnly) { this._keyboard.grab(); }
@@ -1234,8 +1431,8 @@ export default class RFB extends EventTargetMixin {
         encs.push(encodings.encodingRaw);
 
         // Psuedo-encoding settings
-        encs.push(encodings.pseudoEncodingQualityLevel0 + 6);
-        encs.push(encodings.pseudoEncodingCompressLevel0 + 2);
+        encs.push(encodings.pseudoEncodingQualityLevel0 + this._qualityLevel);
+        encs.push(encodings.pseudoEncodingCompressLevel0 + this._compressionLevel);
 
         encs.push(encodings.pseudoEncodingDesktopSize);
         encs.push(encodings.pseudoEncodingLastRect);
@@ -1244,8 +1441,11 @@ export default class RFB extends EventTargetMixin {
         encs.push(encodings.pseudoEncodingXvp);
         encs.push(encodings.pseudoEncodingFence);
         encs.push(encodings.pseudoEncodingContinuousUpdates);
+        encs.push(encodings.pseudoEncodingDesktopName);
+        encs.push(encodings.pseudoEncodingExtendedClipboard);
 
         if (this._fb_depth == 24) {
+            encs.push(encodings.pseudoEncodingVMwareCursor);
             encs.push(encodings.pseudoEncodingCursor);
         }
 
@@ -1301,18 +1501,167 @@ export default class RFB extends EventTargetMixin {
         Log.Debug("ServerCutText");
 
         if (this._sock.rQwait("ServerCutText header", 7, 1)) { return false; }
+
         this._sock.rQskipBytes(3);  // Padding
-        const length = this._sock.rQshift32();
-        if (this._sock.rQwait("ServerCutText", length, 8)) { return false; }
 
-        const text = this._sock.rQshiftStr(length);
+        let length = this._sock.rQshift32();
+        length = toSigned32bit(length);
 
-        if (this._viewOnly) { return true; }
+        if (this._sock.rQwait("ServerCutText content", Math.abs(length), 8)) { return false; }
 
-        this.dispatchEvent(new CustomEvent(
-            "clipboard",
-            { detail: { text: text } }));
+        if (length >= 0) {
+            //Standard msg
+            const text = this._sock.rQshiftStr(length);
+            if (this._viewOnly) {
+                return true;
+            }
 
+            this.dispatchEvent(new CustomEvent(
+                "clipboard",
+                { detail: { text: text } }));
+
+        } else {
+            //Extended msg.
+            length = Math.abs(length);
+            const flags = this._sock.rQshift32();
+            let formats = flags & 0x0000FFFF;
+            let actions = flags & 0xFF000000;
+
+            let isCaps = (!!(actions & extendedClipboardActionCaps));
+            if (isCaps) {
+                this._clipboardServerCapabilitiesFormats = {};
+                this._clipboardServerCapabilitiesActions = {};
+
+                // Update our server capabilities for Formats
+                for (let i = 0; i <= 15; i++) {
+                    let index = 1 << i;
+
+                    // Check if format flag is set.
+                    if ((formats & index)) {
+                        this._clipboardServerCapabilitiesFormats[index] = true;
+                        // We don't send unsolicited clipboard, so we
+                        // ignore the size
+                        this._sock.rQshift32();
+                    }
+                }
+
+                // Update our server capabilities for Actions
+                for (let i = 24; i <= 31; i++) {
+                    let index = 1 << i;
+                    this._clipboardServerCapabilitiesActions[index] = !!(actions & index);
+                }
+
+                /*  Caps handling done, send caps with the clients
+                    capabilities set as a response */
+                let clientActions = [
+                    extendedClipboardActionCaps,
+                    extendedClipboardActionRequest,
+                    extendedClipboardActionPeek,
+                    extendedClipboardActionNotify,
+                    extendedClipboardActionProvide
+                ];
+                RFB.messages.extendedClipboardCaps(this._sock, clientActions, {extendedClipboardFormatText: 0});
+
+            } else if (actions === extendedClipboardActionRequest) {
+                if (this._viewOnly) {
+                    return true;
+                }
+
+                // Check if server has told us it can handle Provide and there is clipboard data to send.
+                if (this._clipboardText != null &&
+                    this._clipboardServerCapabilitiesActions[extendedClipboardActionProvide]) {
+
+                    if (formats & extendedClipboardFormatText) {
+                        RFB.messages.extendedClipboardProvide(this._sock, [extendedClipboardFormatText], [this._clipboardText]);
+                    }
+                }
+
+            } else if (actions === extendedClipboardActionPeek) {
+                if (this._viewOnly) {
+                    return true;
+                }
+
+                if (this._clipboardServerCapabilitiesActions[extendedClipboardActionNotify]) {
+
+                    if (this._clipboardText != null) {
+                        RFB.messages.extendedClipboardNotify(this._sock, [extendedClipboardFormatText]);
+                    } else {
+                        RFB.messages.extendedClipboardNotify(this._sock, []);
+                    }
+                }
+
+            } else if (actions === extendedClipboardActionNotify) {
+                if (this._viewOnly) {
+                    return true;
+                }
+
+                if (this._clipboardServerCapabilitiesActions[extendedClipboardActionRequest]) {
+
+                    if (formats & extendedClipboardFormatText) {
+                        RFB.messages.extendedClipboardRequest(this._sock, [extendedClipboardFormatText]);
+                    }
+                }
+
+            } else if (actions === extendedClipboardActionProvide) {
+                if (this._viewOnly) {
+                    return true;
+                }
+
+                if (!(formats & extendedClipboardFormatText)) {
+                    return true;
+                }
+                // Ignore what we had in our clipboard client side.
+                this._clipboardText = null;
+
+                // FIXME: Should probably verify that this data was actually requested
+                let zlibStream = this._sock.rQshiftBytes(length - 4);
+                let streamInflator = new Inflator();
+                let textData = null;
+
+                streamInflator.setInput(zlibStream);
+                for (let i = 0; i <= 15; i++) {
+                    let format = 1 << i;
+
+                    if (formats & format) {
+
+                        let size = 0x00;
+                        let sizeArray = streamInflator.inflate(4);
+
+                        size |= (sizeArray[0] << 24);
+                        size |= (sizeArray[1] << 16);
+                        size |= (sizeArray[2] << 8);
+                        size |= (sizeArray[3]);
+                        let chunk = streamInflator.inflate(size);
+
+                        if (format === extendedClipboardFormatText) {
+                            textData = chunk;
+                        }
+                    }
+                }
+                streamInflator.setInput(null);
+
+                if (textData !== null) {
+                    let tmpText = "";
+                    for (let i = 0; i < textData.length; i++) {
+                        tmpText += String.fromCharCode(textData[i]);
+                    }
+                    textData = tmpText;
+
+                    textData = decodeUTF8(textData);
+                    if ((textData.length > 0) && "\0" === textData.charAt(textData.length - 1)) {
+                        textData = textData.slice(0, -1);
+                    }
+
+                    textData = textData.replace("\r\n", "\n");
+
+                    this.dispatchEvent(new CustomEvent(
+                        "clipboard",
+                        { detail: { text: textData } }));
+                }
+            } else {
+                return this._fail("Unexpected action in extended clipboard message: " + actions);
+            }
+        }
         return true;
     }
 
@@ -1495,6 +1844,9 @@ export default class RFB extends EventTargetMixin {
                 this._FBU.rects = 1; // Will be decreased when we return
                 return true;
 
+            case encodings.pseudoEncodingVMwareCursor:
+                return this._handleVMwareCursor();
+
             case encodings.pseudoEncodingCursor:
                 return this._handleCursor();
 
@@ -1510,6 +1862,9 @@ export default class RFB extends EventTargetMixin {
                 }
                 return true;
 
+            case encodings.pseudoEncodingDesktopName:
+                return this._handleDesktopName();
+
             case encodings.pseudoEncodingDesktopSize:
                 this._resize(this._FBU.width, this._FBU.height);
                 return true;
@@ -1520,6 +1875,122 @@ export default class RFB extends EventTargetMixin {
             default:
                 return this._handleDataRect();
         }
+    }
+
+    _handleVMwareCursor() {
+        const hotx = this._FBU.x;  // hotspot-x
+        const hoty = this._FBU.y;  // hotspot-y
+        const w = this._FBU.width;
+        const h = this._FBU.height;
+        if (this._sock.rQwait("VMware cursor encoding", 1)) {
+            return false;
+        }
+
+        const cursor_type = this._sock.rQshift8();
+
+        this._sock.rQshift8(); //Padding
+
+        let rgba;
+        const bytesPerPixel = 4;
+
+        //Classic cursor
+        if (cursor_type == 0) {
+            //Used to filter away unimportant bits.
+            //OR is used for correct conversion in js.
+            const PIXEL_MASK = 0xffffff00 | 0;
+            rgba = new Array(w * h * bytesPerPixel);
+
+            if (this._sock.rQwait("VMware cursor classic encoding",
+                                  (w * h * bytesPerPixel) * 2, 2)) {
+                return false;
+            }
+
+            let and_mask = new Array(w * h);
+            for (let pixel = 0; pixel < (w * h); pixel++) {
+                and_mask[pixel] = this._sock.rQshift32();
+            }
+
+            let xor_mask = new Array(w * h);
+            for (let pixel = 0; pixel < (w * h); pixel++) {
+                xor_mask[pixel] = this._sock.rQshift32();
+            }
+
+            for (let pixel = 0; pixel < (w * h); pixel++) {
+                if (and_mask[pixel] == 0) {
+                    //Fully opaque pixel
+                    let bgr = xor_mask[pixel];
+                    let r   = bgr >> 8  & 0xff;
+                    let g   = bgr >> 16 & 0xff;
+                    let b   = bgr >> 24 & 0xff;
+
+                    rgba[(pixel * bytesPerPixel)     ] = r;    //r
+                    rgba[(pixel * bytesPerPixel) + 1 ] = g;    //g
+                    rgba[(pixel * bytesPerPixel) + 2 ] = b;    //b
+                    rgba[(pixel * bytesPerPixel) + 3 ] = 0xff; //a
+
+                } else if ((and_mask[pixel] & PIXEL_MASK) ==
+                           PIXEL_MASK) {
+                    //Only screen value matters, no mouse colouring
+                    if (xor_mask[pixel] == 0) {
+                        //Transparent pixel
+                        rgba[(pixel * bytesPerPixel)     ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 1 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 2 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 3 ] = 0x00;
+
+                    } else if ((xor_mask[pixel] & PIXEL_MASK) ==
+                               PIXEL_MASK) {
+                        //Inverted pixel, not supported in browsers.
+                        //Fully opaque instead.
+                        rgba[(pixel * bytesPerPixel)     ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 1 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 2 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 3 ] = 0xff;
+
+                    } else {
+                        //Unhandled xor_mask
+                        rgba[(pixel * bytesPerPixel)     ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 1 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 2 ] = 0x00;
+                        rgba[(pixel * bytesPerPixel) + 3 ] = 0xff;
+                    }
+
+                } else {
+                    //Unhandled and_mask
+                    rgba[(pixel * bytesPerPixel)     ] = 0x00;
+                    rgba[(pixel * bytesPerPixel) + 1 ] = 0x00;
+                    rgba[(pixel * bytesPerPixel) + 2 ] = 0x00;
+                    rgba[(pixel * bytesPerPixel) + 3 ] = 0xff;
+                }
+            }
+
+        //Alpha cursor.
+        } else if (cursor_type == 1) {
+            if (this._sock.rQwait("VMware cursor alpha encoding",
+                                  (w * h * 4), 2)) {
+                return false;
+            }
+
+            rgba = new Array(w * h * bytesPerPixel);
+
+            for (let pixel = 0; pixel < (w * h); pixel++) {
+                let data = this._sock.rQshift32();
+
+                rgba[(pixel * 4)     ] = data >> 24 & 0xff; //r
+                rgba[(pixel * 4) + 1 ] = data >> 16 & 0xff; //g
+                rgba[(pixel * 4) + 2 ] = data >> 8 & 0xff;  //b
+                rgba[(pixel * 4) + 3 ] = data & 0xff;       //a
+            }
+
+        } else {
+            Log.Warn("The given cursor type is not supported: "
+                      + cursor_type + " given.");
+            return false;
+        }
+
+        this._updateCursor(rgba, hotx, hoty, w, h);
+
+        return true;
     }
 
     _handleCursor() {
@@ -1555,6 +2026,25 @@ export default class RFB extends EventTargetMixin {
         }
 
         this._updateCursor(rgba, hotx, hoty, w, h);
+
+        return true;
+    }
+
+    _handleDesktopName() {
+        if (this._sock.rQwait("DesktopName", 4)) {
+            return false;
+        }
+
+        let length = this._sock.rQshift32();
+
+        if (this._sock.rQwait("DesktopName", length, 4)) {
+            return false;
+        }
+
+        let name = this._sock.rQshiftStr(length);
+        name = decodeUTF8(name, true);
+
+        this._setDesktopName(name);
 
         return true;
     }
@@ -1710,6 +2200,10 @@ export default class RFB extends EventTargetMixin {
     }
 
     _refreshCursor() {
+        if (this._rfb_connection_state !== "connecting" &&
+            this._rfb_connection_state !== "connected") {
+            return;
+        }
         const image = this._shouldShowDotCursor() ? RFB.cursors.dot : this._cursorImage;
         this._cursor.change(image.rgbaPixels,
                             image.hotx, image.hoty,
@@ -1797,8 +2291,102 @@ RFB.messages = {
         sock.flush();
     },
 
-    // TODO(directxman12): make this unicode compatible?
-    clientCutText(sock, text) {
+    // Used to build Notify and Request data.
+    _buildExtendedClipboardFlags(actions, formats) {
+        let data = new Uint8Array(4);
+        let formatFlag = 0x00000000;
+        let actionFlag = 0x00000000;
+
+        for (let i = 0; i < actions.length; i++) {
+            actionFlag |= actions[i];
+        }
+
+        for (let i = 0; i < formats.length; i++) {
+            formatFlag |= formats[i];
+        }
+
+        data[0] = actionFlag >> 24; // Actions
+        data[1] = 0x00;             // Reserved
+        data[2] = 0x00;             // Reserved
+        data[3] = formatFlag;       // Formats
+
+        return data;
+    },
+
+    extendedClipboardProvide(sock, formats, inData) {
+        // Deflate incomming data and their sizes
+        let deflator = new Deflator();
+        let dataToDeflate = [];
+
+        for (let i = 0; i < formats.length; i++) {
+            // We only support the format Text at this time
+            if (formats[i] != extendedClipboardFormatText) {
+                throw new Error("Unsupported extended clipboard format for Provide message.");
+            }
+
+            // Change lone \r or \n into \r\n as defined in rfbproto
+            inData[i] = inData[i].replace(/\r\n|\r|\n/gm, "\r\n");
+
+            // Check if it already has \0
+            let text = encodeUTF8(inData[i] + "\0");
+
+            dataToDeflate.push( (text.length >> 24) & 0xFF,
+                                (text.length >> 16) & 0xFF,
+                                (text.length >>  8) & 0xFF,
+                                (text.length & 0xFF));
+
+            for (let j = 0; j < text.length; j++) {
+                dataToDeflate.push(text.charCodeAt(j));
+            }
+        }
+
+        let deflatedData = deflator.deflate(new Uint8Array(dataToDeflate));
+
+        // Build data  to send
+        let data = new Uint8Array(4 + deflatedData.length);
+        data.set(RFB.messages._buildExtendedClipboardFlags([extendedClipboardActionProvide],
+                                                           formats));
+        data.set(deflatedData, 4);
+
+        RFB.messages.clientCutText(sock, data, true);
+    },
+
+    extendedClipboardNotify(sock, formats) {
+        let flags = RFB.messages._buildExtendedClipboardFlags([extendedClipboardActionNotify],
+                                                              formats);
+        RFB.messages.clientCutText(sock, flags, true);
+    },
+
+    extendedClipboardRequest(sock, formats) {
+        let flags = RFB.messages._buildExtendedClipboardFlags([extendedClipboardActionRequest],
+                                                              formats);
+        RFB.messages.clientCutText(sock, flags, true);
+    },
+
+    extendedClipboardCaps(sock, actions, formats) {
+        let formatKeys = Object.keys(formats);
+        let data  = new Uint8Array(4 + (4 * formatKeys.length));
+
+        formatKeys.map(x => parseInt(x));
+        formatKeys.sort((a, b) =>  a - b);
+
+        data.set(RFB.messages._buildExtendedClipboardFlags(actions, []));
+
+        let loopOffset = 4;
+        for (let i = 0; i < formatKeys.length; i++) {
+            data[loopOffset]     = formats[formatKeys[i]] >> 24;
+            data[loopOffset + 1] = formats[formatKeys[i]] >> 16;
+            data[loopOffset + 2] = formats[formatKeys[i]] >> 8;
+            data[loopOffset + 3] = formats[formatKeys[i]] >> 0;
+
+            loopOffset += 4;
+            data[3] |= (1 << formatKeys[i]); // Update our format flags
+        }
+
+        RFB.messages.clientCutText(sock, data, true);
+    },
+
+    clientCutText(sock, data, extended = false) {
         const buff = sock._sQ;
         const offset = sock._sQlen;
 
@@ -1808,7 +2396,12 @@ RFB.messages = {
         buff[offset + 2] = 0; // padding
         buff[offset + 3] = 0; // padding
 
-        let length = text.length;
+        let length;
+        if (extended) {
+            length = toUnsigned32bit(-data.length);
+        } else {
+            length = data.length;
+        }
 
         buff[offset + 4] = length >> 24;
         buff[offset + 5] = length >> 16;
@@ -1817,24 +2410,25 @@ RFB.messages = {
 
         sock._sQlen += 8;
 
-        // We have to keep track of from where in the text we begin creating the
+        // We have to keep track of from where in the data we begin creating the
         // buffer for the flush in the next iteration.
-        let textOffset = 0;
+        let dataOffset = 0;
 
-        let remaining = length;
+        let remaining = data.length;
         while (remaining > 0) {
 
             let flushSize = Math.min(remaining, (sock._sQbufferSize - sock._sQlen));
             for (let i = 0; i < flushSize; i++) {
-                buff[sock._sQlen + i] =  text.charCodeAt(textOffset + i);
+                buff[sock._sQlen + i] = data[dataOffset + i];
             }
 
             sock._sQlen += flushSize;
             sock.flush();
 
             remaining -= flushSize;
-            textOffset += flushSize;
+            dataOffset += flushSize;
         }
+
     },
 
     setDesktopSize(sock, width, height, id, flags) {

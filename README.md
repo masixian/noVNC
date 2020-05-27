@@ -24,6 +24,7 @@ for a more complete list with additional info and links.
 - [Browser Requirements](#browser-requirements)
 - [Server Requirements](#server-requirements)
 - [Quick Start](#quick-start)
+- [Installation from Snap Package](#installation-from-snap-package)
 - [Integration and Deployment](#integration-and-deployment)
 - [Authors/Contributors](#authorscontributors)
 
@@ -88,7 +89,7 @@ noVNC uses many modern web technologies so a formal requirement list is
 not available. However these are the minimum versions we are currently
 aware of:
 
-* Chrome 49, Firefox 44, Safari 10, Opera 36, IE 11, Edge 12
+* Chrome 49, Firefox 44, Safari 11, Opera 36, IE 11, Edge 12
 
 
 ### Server Requirements
@@ -115,6 +116,66 @@ proxy.
   script. Hit the Connect button, enter a password if the VNC server has one
   configured, and enjoy!
 
+### Installation from Snap Package
+Running the command below will install the latest release of noVNC from Snap:
+
+`sudo snap install novnc`
+
+#### Running noVNC
+
+You can run the Snap-package installed novnc directly with, for example:
+
+`novnc --listen 6081 --vnc localhost:5901 # /snap/bin/novnc if /snap/bin is not in your PATH`
+
+#### Running as a Service (Daemon)
+The Snap package also has the capability to run a 'novnc' service which can be 
+configured to listen on multiple ports connecting to multiple VNC servers 
+(effectively a service runing multiple instances of novnc).
+Instructions (with example values):
+
+List current services (out-of-box this will be blank):
+
+```
+sudo snap get novnc services
+Key             Value
+services.n6080  {...}
+services.n6081  {...}
+```
+
+Create a new service that listens on port 6082 and connects to the VNC server 
+running on port 5902 on localhost:
+
+`sudo snap set novnc services.n6082.listen=6082 services.n6082.vnc=localhost:5902`
+
+(Any services you define with 'snap set' will be automatically started)
+Note that the name of the service, 'n6082' in this example, can be anything 
+as long as it doesn't start with a number or contain spaces/special characters.
+
+View the configuration of the service just created:
+
+```
+sudo snap get novnc services.n6082
+Key                    Value
+services.n6082.listen  6082
+services.n6082.vnc     localhost:5902
+```
+
+Disable a service (note that because of a limitation in  Snap it's currently not 
+possible to unset config variables, setting them to blank values is the way 
+to disable a service):
+
+`sudo snap set novnc services.n6082.listen='' services.n6082.vnc=''`
+
+(Any services you set to blank with 'snap set' like this will be automatically stopped)
+
+Verify that the service is disabled (blank values):
+
+```
+sudo snap get novnc services.n6082
+Key                    Value
+services.n6082.listen  
+services.n6082.vnc
+```
 
 ### Integration and Deployment
 
@@ -133,7 +194,6 @@ that list and you think you should be, feel free to send a PR to fix that.
 * Core team:
     * [Joel Martin](https://github.com/kanaka)
     * [Samuel Mannehed](https://github.com/samhed) (Cendio)
-    * [Peter Åstrand](https://github.com/astrand) (Cendio)
     * [Solly Ross](https://github.com/DirectXMan12) (Red Hat / OpenStack)
     * [Pierre Ossman](https://github.com/CendioOssman) (Cendio)
 

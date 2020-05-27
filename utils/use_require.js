@@ -4,7 +4,7 @@ const path = require('path');
 const program = require('commander');
 const fs = require('fs');
 const fse = require('fs-extra');
-const babel = require('babel-core');
+const babel = require('@babel/core');
 
 const SUPPORTED_FORMATS = new Set(['amd', 'commonjs', 'systemjs', 'umd']);
 
@@ -30,8 +30,11 @@ const no_copy_files = new Set([
     // skip these -- they don't belong in the processed application
     path.join(paths.vendor, 'sinon.js'),
     path.join(paths.vendor, 'browser-es-module-loader'),
-    path.join(paths.vendor, 'promise.js'),
     path.join(paths.app, 'images', 'icons', 'Makefile'),
+]);
+
+const only_legacy_scripts = new Set([
+    path.join(paths.vendor, 'promise.js'),
 ]);
 
 const no_transform_files = new Set([
@@ -105,27 +108,11 @@ function transform_html(legacy_scripts, only_legacy) {
                     new_script += `    <script src="${legacy_scripts[i]}"></script>\n`;
                 }
             } else {
-            // Otherwise detect if it's a modern browser and select
-            // variant accordingly
-                new_script += `\
-    <script type="module">\n\
-        window._noVNC_has_module_support = true;\n\
-    </script>\n\
-    <script>\n\
-        window.addEventListener("load", function() {\n\
-            if (window._noVNC_has_module_support) return;\n\
-            let legacy_scripts = ${JSON.stringify(legacy_scripts)};\n\
-            for (let i = 0;i < legacy_scripts.length;i++) {\n\
-                let script = document.createElement("script");\n\
-                script.src = legacy_scripts[i];\n\
-                script.async = false;\n\
-                document.head.appendChild(script);\n\
-            }\n\
-        });\n\
-    </script>\n`;
-
-            // Original, ES6 modules
+                // Otherwise include both modules and legacy fallbacks
                 new_script += '    <script type="module" crossorigin="anonymous" src="app/ui.js"></script>\n';
+                for (let i = 0;i < legacy_scripts.length;i++) {
+                    new_script += `    <script nomodule src="${legacy_scripts[i]}"></script>\n`;
+                }
             }
 
             contents = contents.slice(0, start_ind) + `${new_script}\n` + contents.slice(end_ind);
@@ -147,8 +134,12 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
 
     // NB: we need to make a copy of babel_opts, since babel sets some defaults on it
     const babel_opts = () => ({
-        plugins: [`transform-es2015-modules-${import_format}`],
-        presets: ['es2015'],
+        plugins: [],
+        presets: [
+            [ '@babel/preset-env',
+              { targets: 'ie >= 11',
+                modules: import_format } ]
+        ],
         ast: false,
         sourceMaps: source_maps,
     });
@@ -174,11 +165,10 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
     const helper = helpers[import_format];
 
     const outFiles = [];
+    const legacyFiles = [];
 
     const handleDir = (js_only, vendor_rewrite, in_path_base, filename) => Promise.resolve()
         .then(() => {
-            if (no_copy_files.has(filename)) return;
-
             const out_path = path.join(out_path_base, path.relative(in_path_base, filename));
             const legacy_path = path.join(legacy_path_base, path.relative(in_path_base, filename));
 
@@ -190,9 +180,26 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
                 return;  // skip non-javascript files
             }
 
+            if (no_transform_files.has(filename)) {
+                return ensureDir(path.dirname(out_path))
+                    .then(() => {
+                        console.log(`Writing ${out_path}`);
+                        return copy(filename, out_path);
+                    });
+            }
+
+            if (only_legacy_scripts.has(filename)) {
+                legacyFiles.push(legacy_path);
+                return ensureDir(path.dirname(legacy_path))
+                    .then(() => {
+                        console.log(`Writing ${legacy_path}`);
+                        return copy(filename, legacy_path);
+                    });
+            }
+
             return Promise.resolve()
                 .then(() => {
-                    if (only_legacy && !no_transform_files.has(filename)) {
+                    if (only_legacy) {
                         return;
                     }
                     return ensureDir(path.dirname(out_path))
@@ -203,10 +210,6 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
                 })
                 .then(() => ensureDir(path.dirname(legacy_path)))
                 .then(() => {
-                    if (no_transform_files.has(filename)) {
-                        return;
-                    }
-
                     const opts = babel_opts();
                     if (helper && helpers.optionsOverride) {
                         helper.optionsOverride(opts);
@@ -241,10 +244,6 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
                 });
         });
 
-    if (with_app_dir && helper && helper.noCopyOverride) {
-        helper.noCopyOverride(paths, no_copy_files);
-    }
-
     Promise.resolve()
         .then(() => {
             const handler = handleDir.bind(null, true, false, in_path || paths.main);
@@ -273,8 +272,18 @@ function make_lib_files(import_format, source_maps, with_app_dir, only_legacy) {
             console.log(`Writing ${out_app_path}`);
             return helper.appWriter(out_path_base, legacy_path_base, out_app_path)
                 .then((extra_scripts) => {
-                    const rel_app_path = path.relative(out_path_base, out_app_path);
-                    const legacy_scripts = extra_scripts.concat([rel_app_path]);
+                    let legacy_scripts = [];
+
+                    legacyFiles.forEach((file) => {
+                        let rel_file_path = path.relative(out_path_base, file);
+                        legacy_scripts.push(rel_file_path);
+                    });
+
+                    legacy_scripts = legacy_scripts.concat(extra_scripts);
+
+                    let rel_app_path = path.relative(out_path_base, out_app_path);
+                    legacy_scripts.push(rel_app_path);
+
                     transform_html(legacy_scripts, only_legacy);
                 })
                 .then(() => {
